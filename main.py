@@ -52,44 +52,126 @@ except Exception:
                     os.environ.setdefault(k.strip(), v.strip())
 
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+# v2: default model changed + fallback list, because qwen3-coder:free
+# returned HTTP 404 (model not found) on 2026-10-27.
 MODEL = os.environ.get("MODEL", "qwen/qwen3-235b-a22b:free")
+FALLBACK_MODELS = [
+    "qwen/qwen3-235b-a22b:free",
+    "qwen/qwen3-coder:free",
+    "google/gemini-2.0-flash-exp:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "openai/gpt-oss-120b:free",
+]
 
 STOP_FLAG = {"stop": False}
 BROWSER_THREAD = {"running": False}
 
 
 def load_rules():
-    try:
-        with open("RULES.md", encoding="utf-8") as f:
-            return f.read()[:4000]
-    except Exception:
-        return "You are a helpful assistant. Answer in Bengali script, short, action-first."
+    import sys
+    candidates = ["RULES.md"]
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        candidates.insert(0, os.path.join(base, "RULES.md"))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "RULES.md"))
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()[:4000]
+        except Exception:
+            continue
+    return "You are a helpful assistant. Answer in Bengali script, short, action-first."
 
 
 def ask_brain(user_text):
-    """Chat box -> brain (OpenRouter). Returns text, never the key."""
-    if not API_KEY:
-        return ("Key পাওয়া যায়নি। .env ফাইলে OPENROUTER_API_KEY বসাও, "
-                "তারপর আবার লিখো। Key চ্যাটে দিও না।")
+    """Chat box -> brain (OpenRouter). Returns text, never the key.
+    Tries the configured model first, then free fallbacks on 404."""
     import urllib.request
-    messages = [
-        {"role": "system", "content": load_rules()},
-        {"role": "user", "content": user_text},
-    ]
-    data = json.dumps({"model": MODEL, "messages": messages}).encode("utf-8")
-    req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions",
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {API_KEY}",
-            "HTTP-Referer": "http://localhost",
-            "X-Title": "Muse AI Prototype",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-    return result["choices"][0]["message"]["content"]
+    import urllib.error
+    key = API_KEY
+    if not key and os.path.exists(".env"):
+        try:
+            with open(".env", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("OPENROUTER_API_KEY="):
+                        key = line.strip().split("=", 1)[1].strip()
+        except Exception:
+            pass
+    if not key:
+        return ("Key পাওয়া যায়নি। .env ফাইলে OPENROUTER_API_KEY বসাও, "
+                "তারপর অ্যাপ রিস্টার্ট করে আবার লিখো। Key চ্যাটে দিও না।")
+    models = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
+    last_error = ""
+    # v3: if all hardcoded models 404, fetch OpenRouter's live free-model
+    # list with the user's own key and try those, instead of guessing names.
+    def live_free_models():
+        try:
+            req2 = urllib.request.Request(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+            with urllib.request.urlopen(req2, timeout=60) as resp2:
+                data2 = json.loads(resp2.read().decode("utf-8"))
+            ids = [d.get("id", "") for d in data2.get("data", [])]
+            free = [i for i in ids if i.endswith(":free")]
+            # Prefer Qwen, then Google, then any other free model
+            free.sort(key=lambda i: (0 if "qwen" in i else 1 if "gemini" in i else 2))
+            return [i for i in free if i not in models][:5]
+        except Exception:
+            return []
+    for model in models:
+        try:
+            messages = [
+                {"role": "system", "content": load_rules()},
+                {"role": "user", "content": user_text},
+            ]
+            data = json.dumps({"model": model, "messages": messages}).encode("utf-8")
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/chat/completions",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {key}",
+                    "HTTP-Referer": "http://localhost",
+                    "X-Title": "Muse AI Prototype",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            return result["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as e:
+            last_error = f"{model}: HTTP {e.code}"
+            if e.code == 404:
+                continue  # try next free model
+            raise
+        except Exception as e:
+            last_error = str(e)
+            break
+    # All hardcoded models failed: try live free models from OpenRouter
+    for model in live_free_models():
+        try:
+            messages = [
+                {"role": "system", "content": load_rules()},
+                {"role": "user", "content": user_text},
+            ]
+            data = json.dumps({"model": model, "messages": messages}).encode("utf-8")
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/chat/completions",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {key}",
+                    "HTTP-Referer": "http://localhost",
+                    "X-Title": "Muse AI Prototype",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            return result["choices"][0]["message"]["content"]
+        except Exception as e:
+            last_error = f"{model}: {e}"
+            continue
+    return f"Brain error: সব ফ্রি মডেল চেষ্টা করেও হয়নি। Last: {last_error}\nKey / internet চেক করো, অথবা OpenRouter-এ Free লেখা কোনো মডেলের নাম .env-এ MODEL= দিয়ে বসাও।"
 
 
 def open_dedicated_browser():
@@ -136,6 +218,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("Muse AI")
         self.geometry("1100x700")
+        self.minsize(800, 500)
         self.configure(bg="#1e1e1e")
 
         # ---- Top bar: colourful Muse AI, like ChatGPT header in screenshot ----
@@ -172,12 +255,14 @@ class App(tk.Tk):
 
         self.chat = scrolledtext.ScrolledText(main, font=("Segoe UI", 11),
                                               bg="#1e1e1e", fg="white", wrap="word")
-        self.chat.pack(fill="both", expand=True)
+        self.chat.pack(side="top", fill="both", expand=True)
         self.show("Muse AI — স্বাগতম!\n\nবামে + Browser চাপলে ডেডিকেটেড ব্রাউজার খুলবে।\nচ্যাটে লিখলে মাথা (Qwen, OpenRouter দিয়ে) উত্তর দেবে।\nSTOP চাপলে ব্রাউজারের কাজ থেমে যাবে।")
 
         # ---- Bottom input box: [+] + entry + Send, like the screenshot ----
+        # v4 fix: bottom bar is pinned to the bottom, so shrinking the
+        # window can no longer push the Send box out of view.
         bottom = tk.Frame(main, bg="#2f2f2f")
-        bottom.pack(fill="x", pady=8)
+        bottom.pack(side="bottom", fill="x", pady=8)
         tk.Button(bottom, text="+", font=("Segoe UI", 14, "bold"),
                   bg="#2f2f2f", fg="white", command=self.on_plus).pack(side="left", padx=6)
         self.entry = tk.Entry(bottom, font=("Segoe UI", 12), bg="#2f2f2f", fg="white", insertbackground="white")
