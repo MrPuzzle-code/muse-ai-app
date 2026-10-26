@@ -52,7 +52,7 @@ except Exception:
                     os.environ.setdefault(k.strip(), v.strip())
 
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
-MODEL = os.environ.get("MODEL", "qwen/qwen3-coder:free")
+MODEL = os.environ.get("MODEL", "qwen/qwen3-235b-a22b:free")
 
 STOP_FLAG = {"stop": False}
 BROWSER_THREAD = {"running": False}
